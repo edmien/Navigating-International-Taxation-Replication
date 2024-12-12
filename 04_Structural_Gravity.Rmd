@@ -1,0 +1,305 @@
+---
+title: "Multisectoral Gravity Model"
+---
+### /!\ Read Carefully the following:
+### For the baseline results (i.e., with Y60 as maritime flows), the replicator is expected to change the working directory in line 23: this is the only change required to run this do-file on any computer.
+### For most alternative scenarios (Y50, Y70, Y0, as well as Y60 with 'low' and 'high' sigma), the replicator must also change the sigma defined in line 28 accordingly.
+### For the alternative scenario in which all betas are included (not only the significant ones), the replicator must change the definition of beta in line 69-70 accordingly. Note that the replicator can also run the estimations using alternative levels of significance if wanted.
+### In our study, we estimated the impact of a $40/tCO2 carbon tax. However, the replicator can simulate any carbon tax by simply replacing 40 with the desired value in line 35. Similarly, if one wants to simulate the impact of a carbon tax in a different reference year (i.e., different from 2019), one simply needs to replace the variable pt defined in line 36 with the annual HFO price value for the desired reference year.
+
+### Preliminary Steps and Importation of Libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(haven) #For importation and exportation of data
+library(foreign) #For exportation of data in .dta format
+library(tidyr) #For computations
+library(dplyr) #For computations
+library(tensor) #For computations
+```
+
+### Importation of Data and Selection of Input Parameters: These parameters can be changed for the alternative scenarios
+```{r}
+setwd('')
+data = read_dta("Results/Estimation Results.dta")
+K = length(unique(data$Product))
+N = length(unique(data$Exporter))
+
+sigma <- data$sigma_60 #Baseline value of sigma to use for the main results
+#sigma <- data$sigma_50 #Alternative value of sigma to use if the replicator defined 'local = 50' in the previous "03_PPML_Estimations.do"
+#sigma <- data$sigma_70 #Alternative value of sigma to use if the replicator defined 'local = 70' in the previous "03_PPML_Estimations.do"
+#sigma <- data$sigma_0 #Alternative value of sigma to use if the replicator defined 'local = 0' in the previous "03_PPML_Estimations.do"
+#sigma <- data$sigma_60_low #Alternative value of sigma to use if the replicator wants to test for the first quartile sigma
+#sigma <- data$sigma_60_high #Alternative value of sigma to use if the replicator wants to test for the third quartile sigma
+
+tax <- 40 * 3.12 #We use 3.12 as the coefficient between USD/tCO2 and USD/tFuel. To simulate the tax, one can replace 40 with the desired value of the carbon tax (in USD per ton of CO2)
+pt <- 377.4167   #We include the value of HFO in 2019 (can be changed if using another value of Fuel prices or another year of reference)
+```
+
+### Verification that all Yijk are (not strictly) positive
+```{r}
+positives <- all(data$Yijk >= 0)
+if (positives) {
+  print("All Yijk are positive or null.")
+} else {
+  print("Error: There is at least one negative Yijk.")
+}
+```
+
+### Initialization of Arrays and Matrixes
+```{r}
+data$Exporter <- as.factor(data$Exporter)
+data$Importer <- as.factor(data$Importer)
+data$Product <- as.factor(data$Product)
+
+N <- length(levels(data$Exporter)) #Nb of exporters = Nb of importers = N
+K <- length(levels(data$Product))  #Nb of sectors = K
+
+Yijk <- array(NA, dim = c(N, N, K))
+beta <- array(NA, dim = c(N, N, K))
+Seadistance <- array(NA, dim = c(N, N, K))
+tijk_hat <- array(NA, dim = c(N, N, K))
+
+for (i in 1:nrow(data)) {
+  Exporter <- as.integer(data$Exporter[i])
+  Importer <- as.integer(data$Importer[i])
+  Product <- as.integer(data$Product[i])
+  
+  Yijk[Exporter, Importer, Product] <- data$Yijk[i]
+  beta[Exporter, Importer, Product] <- data$beta[i] * data$significant05[i] #We select only betas significantly different from 0
+  #beta[Exporter, Importer, Product] <- data$beta[i]                        #If one wants to keep all betas and not only the significant ones
+  Seadistance[Exporter, Importer, Product] <- data$Seadistance[i]
+}
+for (i in 1:N) {
+ for (j in 1:N) {
+  for (k in 1:K) {
+     tijk_hat[i,j,k] <- ( ( 1 + Seadistance[i,j,k] * (pt + tax)) / (1 + Seadistance[i,j,k] * pt) ) ^ (beta[i,j,k] / (1 - sigma[k]))
+    }
+  }
+}
+```
+
+### Preliminary Computations
+```{r}
+preliminary_computations = function(Yijk, sigma) {
+  N <- dim(Yijk)[1]
+  K <- dim(Yijk)[3]
+
+  Yik <- apply(Yijk, c(1, 3), sum) #Yik: Sum of Yijk over j (Matrix N*K)
+  Yi <- apply(Yik, 1, sum) #Yi: Sum of Yijk over j and k (Vector 1*N)
+  Y <- sum(Yi) #Y: Sum of Yijk over i, j, and k (Constant)
+
+  Ejk <- apply(Yijk, c(2, 3), sum) #Ejk: Sum of Yijk over i (Matrix N*K)
+  Ej <- apply(Ejk, 1, sum) #Ej: Sum of Yijk over i and k (Vector 1*K)
+
+  lambda <- array(dim = c(N, N, K)) #λijk=Yijk/Ejk (Array N*N*K)
+    for (i in 1:N) {
+     for (j in 1:N) {
+      for (k in 1:K) {
+              lambda[i,j,k] <- Yijk[i,j,k] / Ejk[j,k]
+      }
+     }
+    }
+
+  phi <- Ej / Yi #φi=Ei/Yi (Vector 1*N)
+  alpha <- Ejk / Ej #αik=Eik/Ei (Matrix N*K)
+
+  return(list("Yik" = Yik, "Yi" = Yi, "Y" = Y, "Ejk" = Ejk, "Ej" = Ej, "lambda" = lambda, "phi" = phi, "alpha" = alpha))
+}
+
+  preliminary_results <- preliminary_computations(Yijk, sigma)
+```
+
+### Verification that all Yik and all Ejk are strictly positive
+```{r}
+positives <- all(preliminary_results$Yik > 0)
+if (positives) {
+  print("All Yik are strictly positive.")
+} else {
+  print("Error: There is at least one Yik equal to zero")
+}
+
+positives <- all(preliminary_results$Ejk > 0)
+if (positives) {
+  print("All Ejk are strictly positive.")
+} else {
+  print("Error: There is at least one Ejk equal to zero")
+}
+```
+
+### Implementation of the Loop
+```{r}
+iterative_loop <- function(preliminary_results, sigma, tijk_hat, epsilon = 0.001, max_iterations = 1000) {
+    Yik <- preliminary_results$Yik
+    Ejk <- preliminary_results$Ejk
+    lambda <- preliminary_results$lambda
+    alpha <- preliminary_results$alpha
+    phi <- preliminary_results$phi
+    Y <- preliminary_results$Y
+
+    N <- dim(Yik)[1]
+    K <- dim(Yik)[2]
+
+    Pjk_hat <- array(1, dim = c(N, K))
+    Ejk_prime <- Ejk
+    Yik_hat <- array(1, dim = c(N, K))
+    Yik_tilde <- array(1, dim = c(N, K))
+    
+    intermediate_array <- array(dim = c(N, N, K))
+    intermediate_matrix <- array(dim = c(N, K))
+    intermediate_vector <- numeric(N) # dimension = N
+
+    convergence <- FALSE
+
+    for (iteration in 1:max_iterations) {
+        Yik_hat_prev <- Yik_hat
+        
+        # We estimate Yik(n)_tilde
+        for (i in 1:N) {
+          for (j in 1:N) {
+            for (k in 1:K) {
+        intermediate_array[i,j,k] <- lambda[i,j,k] * (tijk_hat[i,j,k] ^ (1 - sigma[k])) * Ejk_prime[j,k] / (Pjk_hat[j,k] ^ (1 - sigma[k]))
+            }
+          }
+        }
+        intermediate_matrix <- apply(intermediate_array, c(1,3), sum)
+        for (i in 1:N) {
+          for (k in 1:K) {
+            Yik_tilde[i,k] <- (intermediate_matrix[i,k] / Yik[i,k]) ^ (1 / sigma[k])
+          }
+        }      
+        
+        # We estimate Yik(n)_hat
+        intermediate_matrix <- Yik_tilde * Yik
+        intermediate_scalar <- sum(intermediate_matrix)
+        for (i in 1:N) {
+          for (k in 1:K) {
+            Yik_hat[i, k] <- Yik_tilde[i, k] * Y / intermediate_scalar
+          }
+        } 
+        
+        # We estimate Pjk(n)_hat
+        for (i in 1:N) {
+          for (j in 1:N) {
+            for (k in 1:K) {
+        intermediate_array[i,j,k] <- lambda[i,j,k] * (Yik_hat[j,k] * tijk_hat[i,j,k]) ^ (1 - sigma[k])
+            }
+          }
+        }
+      intermediate_matrix <- apply(intermediate_array, c(2, 3), sum)
+      for (j in 1:N) {
+          for (k in 1:K) {
+             Pjk_hat[j, k] <- intermediate_matrix[j,k] ^ (1 / (1-sigma[k]))
+          }
+        }    
+        
+        # We estimate Ejk(n)_prime
+        intermediate_matrix <- Yik_hat * Yik
+        intermediate_vector <- apply(intermediate_matrix, 1, sum)
+        for (j in 1:N) {
+            for (k in 1:K) {
+                Ejk_prime[j, k] <- alpha[j, k] * phi[j] * intermediate_vector[j]
+            }
+        }
+
+        # We check if convergence is achieved
+        if (any(is.na(Yik_hat), na.rm = TRUE) || any(is.na(Yik_hat_prev), na.rm = TRUE)) {
+            warning("NA values found in Yik_hat")
+            break
+        }
+         if (max(abs((Yik_hat - Yik_hat_prev)/Yik_hat_prev), na.rm = TRUE) <= epsilon) {
+            convergence <- TRUE
+            break
+         }
+    }
+
+    return(list("Pjk_hat" = Pjk_hat, "Ejk_prime" = Ejk_prime, "Yik_hat" = Yik_hat, "Yik_tilde" = Yik_tilde, "convergence" = convergence))
+}
+
+iterative_results <- iterative_loop(preliminary_results, sigma, tijk_hat)
+```
+
+### Final Computations
+```{r}
+final_computations <- function(iterative_results, preliminary_results, sigma) {
+  N <- dim(preliminary_results$Yik)[1]
+  K <- dim(preliminary_results$Yik)[2]
+  Ejk_prime <- iterative_results$Ejk_prime
+  Ejk <- preliminary_results$Ejk
+  Yik_hat <- iterative_results$Yik_hat
+  Pjk_hat <- iterative_results$Pjk_hat
+  lambda <- preliminary_results$lambda
+  Enik_prime <- iterative_results$Enik_prime
+  alpha <- preliminary_results$alpha
+  Ej <- preliminary_results$Ej
+
+  Wi_hat <- numeric(N)  
+  Pi_hat <- numeric(N)  
+  Yijk_prime <- array(dim = c(N, N, K))  
+  lambda_hat = array(dim = c(N, N, K))
+  intermediate_array <- array(dim = c(N, N, K))
+  intermediate_matrix <- array(dim = c(N, K))
+
+  # We estimate Ei_prime
+  Ei_prime = apply(Ejk_prime, 1, sum)
+  
+  # We estimate lambda_hat
+  for (i in 1:N) {
+   for (j in 1:N) {
+    for (k in 1:K) {
+     intermediate_array[i,j,k] <- lambda[i,j,k] * (Yik_hat[i,k] * tijk_hat[i,j,k])^(1-sigma[k])
+    }
+   }
+  }
+  intermediate_matrix <- apply(intermediate_array, c(2,3), sum)
+  for (i in 1:N) {
+   for (j in 1:N) {
+    for (k in 1:K) {
+     lambda_hat[i,j,k] <- ((Yik_hat[i,k] * tijk_hat[i,j,k])^(1-sigma[k])) / intermediate_matrix[j,k]
+    }
+   }
+  }
+  
+  # We estimate Pi_hat
+  for (i in 1:N) {
+   for (k in 1:K) {   
+    intermediate_matrix[i,k] <- Pjk_hat[i,k]^alpha[i,k]
+   }
+  }
+  Pi_hat <- apply(intermediate_matrix, 1, prod)
+  
+  # We estimate Wi_hat
+  for (i in 1:N) {
+   Wi_hat[i]= Ei_prime[i]/(Ej[i]*Pi_hat[i])
+  }
+  
+  # We estimate Yijk_prime
+  for (i in 1:N) {
+   for (j in 1:N) {
+    for (k in 1:K) {
+     Yijk_prime[i,j,k] <- Yijk[i,j,k] * lambda_hat[i,j,k] * Ejk_prime[j,k] / Ejk[j,k]
+    }
+   }
+  }
+  
+  list(Wi_hat = Wi_hat, Pi_hat = Pi_hat, Yijk_prime = Yijk_prime)
+}
+final_results <- final_computations(iterative_results, preliminary_results, sigma)
+```
+
+### Storage and Export of Results
+```{r}
+Yijk_prime <- aperm(final_results$Yijk_prime, c(3,2,1)) # We reorganize the array to ensure the good position of each cell in the data.frame
+Yijk_prime_vector <- as.vector(Yijk_prime)
+Yijk_prime_df <- data.frame(Yijk_prime = Yijk_prime_vector)
+data$Yijk_prime <- Yijk_prime_df$Yijk_prime
+
+Wi_hat <- final_results$Wi_hat
+Pi_hat <- final_results$Pi_hat
+Wi_Pi_df <- data.frame(Wi_hat = rep(Wi_hat, each = length(unique(data$Importer)) * length(unique(data$Product))),
+                        Pi_hat = rep(Pi_hat, each = length(unique(data$Importer)) * length(unique(data$Product))))  
+data <- cbind(data, Wi_Pi_df)
+head(data)
+
+write_dta(data, "Results/Final Results.dta")
+```
